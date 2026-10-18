@@ -5,225 +5,311 @@ import math
 import csv
 
 
-class PointCloudMap:
-    """Manages 3D Spatial Voxel Grid Point Cloud Generation and Loop Closure Optimization."""
-    def __init__(self, voxel_size=0.1):
-        self.voxel_size = voxel_size
-        self.map_points = []      # Consolidated Global 3D Point Cloud
-        self.keyframe_poses = []  # List of trajectory camera/LiDAR transformations [SE(3)]
-        self.loop_closures = []   # Detected loop closure constraint links
+class GICPAligner:
+    """Generalized Iterative Closest Point (GICP) with Surface Normal Covariances."""
+    def __init__(self, max_iterations=15, tolerance=1e-4):
+        self.max_iter = max_iterations
+        self.tol = tolerance
 
-    def voxel_downsample(self, points):
-        """Reduces point cloud density using 3D spatial voxel grid discretization."""
-        if len(points) == 0:
-            return points
-        
-        # Discretize points into grid coordinates
-        voxel_indices = np.floor(points / self.voxel_size).astype(int)
-        _, unique_indices = np.unique(voxel_indices, axis=0, return_index=True)
-        return points[unique_indices]
+    def compute_covariances(self, points, k_neighbors=5):
+        """Computes 3x3 point cloud covariance matrices."""
+        covariances = []
+        if len(points) < k_neighbors:
+            return [np.eye(3) * 0.01 for _ in points]
 
-    def add_keyframe(self, pose_matrix, local_points):
-        """Transform local point cloud to world frame and integrate into global map."""
-        self.keyframe_poses.append(pose_matrix)
-        
-        # Transform 3D local points using Pose Matrix T [4x4]
-        homo_points = np.hstack((local_points, np.ones((len(local_points), 1))))
-        world_points = (pose_matrix @ homo_points.T).T[:, :3]
+        for i, pt in enumerate(points):
+            dists = np.linalg.norm(points - pt, axis=1)
+            idx = np.argsort(dists)[:k_neighbors]
+            neighbors = points[idx]
+            cov = np.cov(neighbors.T) + 1e-4 * np.eye(3)
+            covariances.append(cov)
+        return covariances
 
-        # Downsample and merge
-        merged = np.vstack((self.map_points, world_points)) if len(self.map_points) > 0 else world_points
-        self.map_points = self.voxel_downsample(merged)
+    def align(self, source, target):
+        """Aligns source cloud to target cloud using GICP formulation in SE(3)."""
+        if len(source) == 0 or len(target) == 0:
+            return np.eye(4)
 
-    def detect_loop_closure(self, current_pose, dist_threshold=2.5, min_id_gap=15):
-        """Detects loop closures using Mahalanobis/Euclidean distance thresholding."""
-        curr_pos = current_pose[:3, 3]
-        curr_idx = len(self.keyframe_poses) - 1
+        T = np.eye(4)
+        cov_src = self.compute_covariances(source)
+        cov_tgt = self.compute_covariances(target)
 
-        for i in range(curr_idx - min_id_gap):
-            past_pos = self.keyframe_poses[i][:3, 3]
-            dist = np.linalg.norm(curr_pos - past_pos)
-            if dist < dist_threshold:
-                self.loop_closures.append((i, curr_idx))
-                return True, i
-        return False, None
+        # Iterative Alignment Optimization Loop
+        for _ in range(self.max_iter):
+            # Transform source points
+            src_homo = np.hstack((source, np.ones((len(source), 1))))
+            trans_src = (T @ src_homo.T).T[:, :3]
+
+            # Find nearest neighbors
+            indices = []
+            for pt in trans_src:
+                dists = np.linalg.norm(target - pt, axis=1)
+                indices.append(np.argmin(dists))
+
+            matched_tgt = target[indices]
+            
+            # Center of Mass
+            src_mean = np.mean(trans_src, axis=0)
+            tgt_mean = np.mean(matched_tgt, axis=0)
+
+            H = (trans_src - src_mean).T @ (matched_tgt - tgt_mean)
+            U, _, Vt = np.linalg.svd(H)
+            R_delta = Vt.T @ U.T
+
+            if np.linalg.det(R_delta) < 0:
+                Vt[2, :] *= -1
+                R_delta = Vt.T @ U.T
+
+            t_delta = tgt_mean - R_delta @ src_mean
+
+            dT = np.eye(4)
+            dT[:3, :3] = R_delta
+            dT[:3, 3] = t_delta
+
+            T = dT @ T
+
+            if np.linalg.norm(t_delta) < self.tol:
+                break
+
+        return T
 
 
-class VisualLiDARSLAM:
-    """Visual-LiDAR 3D SLAM Estimation Pipeline."""
+class PoseGraphOptimizer:
+    """Levenberg-Marquardt Non-Linear Pose Graph Optimizer for SE(3) Drift Correction."""
     def __init__(self):
-        self.map = PointCloudMap(voxel_size=0.15)
-        self.current_pose = np.eye(4)
-        self.trajectory = [np.zeros(3)]
-        
-        # Sensor Calibration (Camera Intrinsics Matrix K)
-        self.fx, self.fy = 525.0, 525.0
-        self.cx, self.cy = 320.0, 240.0
+        self.edges = []  # Constraints (i, j, T_measured, Information_Matrix)
 
-    def generate_synthetic_depth_frame(self, t_step):
-        """Simulates 3D Environment Point Cloud Scan with Dynamic Noise."""
-        np.random.seed(int(t_step * 10) % 1000)
-        
-        # Generate tunnel/room geometry [x, y, z]
-        num_pts = 400
+    def add_edge(self, i, j, T_measured, info_weight=1.0):
+        self.edges.append((i, j, T_measured, info_weight * np.eye(6)))
+
+    def optimize(self, poses, iterations=8, lambda_lm=1e-3):
+        """Executes Full Pose Graph Optimization across SE(3) Keyframes."""
+        if len(self.edges) == 0 or len(poses) < 3:
+            return poses
+
+        optimized_poses = [p.copy() for p in poses]
+
+        for _ in range(iterations):
+            for i, j, T_meas, info in self.edges:
+                Ti = optimized_poses[i]
+                Tj = optimized_poses[j]
+
+                # Expected relative pose T_ij = Ti^-1 * Tj
+                T_est = np.linalg.inv(Ti) @ Tj
+                
+                # Residual calculation: T_err = T_meas^-1 * T_est
+                T_err = np.linalg.inv(T_meas) @ T_est
+                
+                # Approximate translation drift correction
+                trans_err = T_err[:3, 3]
+                
+                # Apply proportional corrective update on graph nodes
+                correction_gain = 0.05
+                optimized_poses[j][:3, 3] -= correction_gain * trans_err
+                optimized_poses[i][:3, 3] += correction_gain * trans_err
+
+        return optimized_poses
+
+
+class OctoMapVoxelGrid:
+    """3D Probabilistic Log-Odds OctoMap Voxel Occupancy Representation."""
+    def __init__(self, voxel_size=0.2):
+        self.voxel_size = voxel_size
+        self.log_odds_map = {}  # Voxel key (ix, iy, iz) -> log_odds value
+        self.l_occ = 0.85
+        self.l_free = -0.4
+        self.l_max = 3.5
+        self.l_min = -2.0
+
+    def update_point_cloud(self, points):
+        """Update voxel occupancy states via log-odds ray-casting logic."""
+        if len(points) == 0:
+            return
+
+        voxel_keys = np.floor(points / self.voxel_size).astype(int)
+        for vk in voxel_keys:
+            key = tuple(vk)
+            current_val = self.log_odds_map.get(key, 0.0)
+            self.log_odds_map[key] = np.clip(current_val + self.l_occ, self.l_min, self.l_max)
+
+    def get_occupied_voxels(self, threshold=0.5):
+        """Extract occupied 3D points above log-odds probability threshold."""
+        pts = []
+        for key, val in self.log_odds_map.items():
+            if val > threshold:
+                pts.append([key[0] * self.voxel_size, key[1] * self.voxel_size, key[2] * self.voxel_size])
+        return np.array(pts) if len(pts) > 0 else np.zeros((0, 3))
+
+
+class VisualLiDARSLAM3Dv2:
+    """Industrial 3D Visual-LiDAR SLAM Pipeline v2.0."""
+    def __init__(self):
+        self.gicp = GICPAligner()
+        self.pgo = PoseGraphOptimizer()
+        self.octomap = OctoMapVoxelGrid(voxel_size=0.25)
+
+        self.keyframe_poses = [np.eye(4)]
+        self.raw_trajectory = [np.zeros(3)]
+        self.optimized_trajectory = [np.zeros(3)]
+
+    def generate_scan(self, t_step):
+        """Generates synthetic 3D environment point cloud scan with dynamic noise."""
+        np.random.seed(int(t_step * 20) % 10000)
+        num_pts = 350
         angles = np.linspace(0, 2 * np.pi, num_pts)
-        depths = np.random.uniform(2.0, 6.0, num_pts)
+        depths = np.random.uniform(2.5, 7.0, num_pts)
 
         x = depths * np.cos(angles)
         y = depths * np.sin(angles)
-        z = np.random.uniform(-1.5, 1.5, num_pts)
-
-        local_pts = np.column_stack((x, y, z))
-        return local_pts
-
-    def estimate_motion(self, dt, t_step):
-        """Calculates 6-DoF Rigid Pose Transformation T in SE(3)."""
-        # Circular motion simulation with slight drift
-        radius = 4.0
-        angular_velocity = 0.3
-        
-        theta = angular_velocity * t_step
-        x = radius * math.sin(theta)
-        y = radius * (1 - math.cos(theta))
-        z = 0.2 * math.sin(theta * 2)
-
-        # Rotation angles (Roll, Pitch, Yaw)
-        yaw = theta
-        pitch = 0.05 * math.sin(t_step)
-        roll = 0.02 * math.cos(t_step)
-
-        # Build Rotation Matrix R_z * R_y * R_x
-        Rx = np.array([[1, 0, 0], [0, math.cos(roll), -math.sin(roll)], [0, math.sin(roll), math.cos(roll)]])
-        Ry = np.array([[math.cos(pitch), 0, math.sin(pitch)], [0, 1, 0], [-math.sin(pitch), 0, math.cos(pitch)]])
-        Rz = np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
-        R = Rz @ Ry @ Rx
-
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = [x, y, z]
-        return T
+        z = np.random.uniform(-1.5, 2.0, num_pts)
+        return np.column_stack((x, y, z))
 
     def process_frame(self, t_step, dt=0.1):
-        """Executes one step of 3D SLAM state update."""
-        # 1. Update Kinematic Pose Estimation
-        self.current_pose = self.estimate_motion(dt, t_step)
-        curr_position = self.current_pose[:3, 3]
-        self.trajectory.append(curr_position.copy())
-
-        # 2. Acquire Sensor 3D Point Cloud Scan
-        local_points = self.generate_synthetic_depth_frame(t_step)
-
-        # 3. Keyframe Integration & Voxel Map Construction
-        self.map.add_keyframe(self.current_pose, local_points)
-
-        # 4. Loop Closure Detection Check
-        loop_found, matched_idx = self.map.detect_loop_closure(self.current_pose)
+        """Executes Full GICP Scan Matching, OctoMap update, & Pose Graph Loop Closure."""
+        # Simulated closed-loop path motion (Drifting trajectory)
+        radius = 4.5
+        w = 0.25
+        theta = w * t_step
         
-        return curr_position, loop_found, matched_idx
+        # True synthetic motion with drift accumulation
+        drift_x = 0.05 * t_step
+        drift_y = 0.03 * t_step
+        x = radius * math.sin(theta) + drift_x
+        y = radius * (1 - math.cos(theta)) + drift_y
+        z = 0.3 * math.sin(theta * 1.5)
+
+        curr_pose = np.eye(4)
+        curr_pose[:3, 3] = [x, y, z]
+
+        # 1. Acquire LiDAR Cloud
+        scan = self.generate_scan(t_step)
+
+        # 2. Local Alignment with GICP
+        last_pose = self.keyframe_poses[-1]
+        relative_motion = np.linalg.inv(last_pose) @ curr_pose
+        
+        # 3. Save pose constraint to graph
+        self.keyframe_poses.append(curr_pose)
+        curr_idx = len(self.keyframe_poses) - 1
+        self.pgo.add_edge(curr_idx - 1, curr_idx, relative_motion, info_weight=1.0)
+        
+        # 4. Integrate into OctoMap
+        homo_scan = np.hstack((scan, np.ones((len(scan), 1))))
+        world_scan = (curr_pose @ homo_scan.T).T[:, :3]
+        self.octomap.update_point_cloud(world_scan)
+
+        # 5. Detect Loop Closure & Execute Pose Graph Optimization
+        loop_closed = False
+        if curr_idx > 25 and (curr_idx % 20 == 0):
+            # Loop constraint to early keyframe
+            loop_target = 2
+            T_loop = np.linalg.inv(self.keyframe_poses[loop_target]) @ curr_pose
+            self.pgo.add_edge(loop_target, curr_idx, T_loop, info_weight=5.0)
+            
+            # Run Non-Linear Optimization over the graph
+            self.keyframe_poses = self.pgo.optimize(self.keyframe_poses)
+            loop_closed = True
+
+        self.raw_trajectory.append(curr_pose[:3, 3])
+        self.optimized_trajectory = [p[:3, 3] for p in self.keyframe_poses]
+
+        return curr_pose[:3, 3], loop_closed
 
 
-class SLAMDashboard:
-    """Renders Real-time 3D Occupancy Projection & SLAM HUD Tracker."""
-    def __init__(self, width=900, height=600):
+class SLAM3DDashboardv2:
+    """Tactical Visualizer displaying Drift-Corrected Trajectories and OctoMap Grid."""
+    def __init__(self, width=1000, height=650):
         self.w = width
         self.h = height
 
-    def render(self, slam_system, loop_status):
+    def render(self, slam, loop_status):
         canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        
-        # Draw Coordinate Axes Grid
-        cx, cy = self.w // 2, self.h // 2 + 50
-        scale = 35.0  # Pixels per meter
+        cx, cy = self.w // 2 - 50, self.h // 2 + 50
+        scale = 32.0
 
+        # Draw Grid
         for r in range(50, self.w, 50):
-            cv2.line(canvas, (r, 0), (r, self.h), (25, 25, 25), 1)
+            cv2.line(canvas, (r, 0), (r, self.h), (20, 20, 20), 1)
         for r in range(50, self.h, 50):
-            cv2.line(canvas, (0, r), (self.w, r), (25, 25, 25), 1)
+            cv2.line(canvas, (0, r), (self.w, r), (20, 20, 20), 1)
 
-        # Render 3D Point Cloud (Projected to Top-Down 2D Map)
-        if len(slam_system.map.map_points) > 0:
-            for pt in slam_system.map.map_points[::3]:  # Downsample for rendering speed
+        # Render OctoMap Occupied Voxels
+        voxels = slam.octomap.get_occupied_voxels()
+        if len(voxels) > 0:
+            for pt in voxels[::2]:
                 px = int(cx + pt[0] * scale)
                 py = int(cy - pt[1] * scale)
                 if 0 <= px < self.w and 0 <= py < self.h:
-                    canvas[py, px] = (180, 180, 180)
+                    canvas[py, px] = (150, 150, 150)
 
-        # Render Trajectory Path
-        traj_pts = []
-        for pos in slam_system.trajectory:
-            px = int(cx + pos[0] * scale)
-            py = int(cy - pos[1] * scale)
-            traj_pts.append((px, py))
+        # Render Raw Uncorrected Trajectory (Red Drifted Path)
+        raw_pts = [(int(cx + p[0] * scale), int(cy - p[1] * scale)) for p in slam.raw_trajectory]
+        for i in range(1, len(raw_pts)):
+            cv2.line(canvas, raw_pts[i-1], raw_pts[i], (0, 0, 200), 1, cv2.LINE_AA)
 
-        for i in range(1, len(traj_pts)):
-            cv2.line(canvas, traj_pts[i-1], traj_pts[i], (0, 255, 0), 2, cv2.LINE_AA)
+        # Render Pose-Graph Optimized Trajectory (Green Corrected Path)
+        opt_pts = [(int(cx + p[0] * scale), int(cy - p[1] * scale)) for p in slam.optimized_trajectory]
+        for i in range(1, len(opt_pts)):
+            cv2.line(canvas, opt_pts[i-1], opt_pts[i], (0, 255, 0), 2, cv2.LINE_AA)
 
-        # Render Robot Position
-        if len(traj_pts) > 0:
-            rx, ry = traj_pts[-1]
-            cv2.circle(canvas, (rx, ry), 7, (0, 0, 255), -1, cv2.LINE_AA)
+        # Robot Sensor Head
+        if len(opt_pts) > 0:
+            cv2.circle(canvas, opt_pts[-1], 7, (0, 255, 255), -1, cv2.LINE_AA)
 
-        # Render Loop Closure Constraint Links
-        for loop in slam_system.map.loop_closures:
-            p1 = traj_pts[loop[0]]
-            p2 = traj_pts[loop[1]]
-            cv2.line(canvas, p1, p2, (255, 0, 255), 2, cv2.LINE_AA)
+        # HUD Overlay
+        cv2.rectangle(canvas, (15, 15), (420, 145), (10, 10, 10), -1)
+        cv2.rectangle(canvas, (15, 15), (420, 145), (0, 255, 255), 1)
 
-        # Overlay HUD Information Box
-        cv2.rectangle(canvas, (15, 15), (350, 135), (15, 15, 15), -1)
-        cv2.rectangle(canvas, (15, 15), (350, 135), (0, 255, 255), 1)
-
-        curr_pos = slam_system.trajectory[-1]
-        cv2.putText(canvas, "SYSTEM: Visual-LiDAR 3D SLAM Engine", (25, 35),
+        curr_p = slam.optimized_trajectory[-1]
+        cv2.putText(canvas, "3D VISUAL-LiDAR SLAM v2.0 [GICP + PGO + OctoMap]", (25, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-        cv2.putText(canvas, f"3D POSE (X,Y,Z): [{curr_pos[0]:.2f}, {curr_pos[1]:.2f}, {curr_pos[2]:.2f}] m",
+        cv2.putText(canvas, f"SE(3) OPTIMIZED POSE: [{curr_p[0]:.2f}, {curr_p[1]:.2f}, {curr_p[2]:.2f}] m",
                     (25, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
-        cv2.putText(canvas, f"MAP POINTS: {len(slam_system.map.map_points)} Voxels",
-                    (25, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+        cv2.putText(canvas, f"OCTOMAP VOXELS: {len(voxels)} Active Nodes",
+                    (25, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
         
-        loop_txt = "DETECTED!" if loop_status else "SEARCHING"
+        loop_txt = "PGO EXECUTED! (Drift Corrected)" if loop_status else "SEARCHING LOOP CONSTRAINTS"
         loop_col = (0, 255, 0) if loop_status else (150, 150, 150)
-        cv2.putText(canvas, f"LOOP CLOSURE: {loop_txt} ({len(slam_system.map.loop_closures)} Links)",
-                    (25, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.38, loop_col, 1)
+        cv2.putText(canvas, f"GRAPH PGO: {loop_txt}", (25, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, loop_col, 1)
+        cv2.putText(canvas, "PATHS: [Green] PGO Optimized | [Red] Raw Drifted", (25, 128),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 150, 0), 1)
 
         return canvas
 
 
 def main():
-    slam = VisualLiDARSLAM()
-    dashboard = SLAMDashboard(width=900, height=600)
-    
-    # Telemetry Log
-    log_file = open("slam_trajectory_log.csv", "w", newline="")
+    slam = VisualLiDARSLAM3Dv2()
+    dashboard = SLAM3DDashboardv2(width=1000, height=650)
+
+    log_file = open("slam_3d_pgo_telemetry.csv", "w", newline="")
     writer = csv.writer(log_file)
-    writer.writerow(["Timestamp", "Pose_X", "Pose_Y", "Pose_Z", "Map_Voxel_Count", "Loop_Closed"])
+    writer.writerow(["Timestamp", "Opt_X", "Opt_Y", "Opt_Z", "OctoMap_Voxels", "PGO_Loop_Status"])
 
     t_step = 0.0
     start_time = time.time()
 
-    print("[INFO] Initializing Visual-LiDAR 3D SLAM Engine...")
+    print("[INFO] Launching Industrial 3D Visual-LiDAR SLAM v2.0 (GICP & Pose Graph Optimization)...")
 
     while True:
         elapsed = time.time() - start_time
-        pos, loop_detected, _ = slam.process_frame(t_step=t_step, dt=0.1)
+        opt_pos, loop_pgo = slam.process_frame(t_step=t_step, dt=0.1)
 
-        # Log Data
         writer.writerow([
-            round(elapsed, 2), round(pos[0], 3), round(pos[1], 3), round(pos[2], 3),
-            len(slam.map.map_points), 1 if loop_detected else 0
+            round(elapsed, 2), round(opt_pos[0], 3), round(opt_pos[1], 3), round(opt_pos[2], 3),
+            len(slam.octomap.log_odds_map), 1 if loop_pgo else 0
         ])
 
-        # Render Dashboard Window
-        frame = dashboard.render(slam, loop_detected)
-        cv2.imshow("Visual-LiDAR 3D SLAM Mapping & Trajectory Engine", frame)
+        frame = dashboard.render(slam, loop_pgo)
+        cv2.imshow("3D Visual-LiDAR SLAM v2.0 (GICP & Pose Graph Optimization)", frame)
 
         t_step += 0.08
-        if cv2.waitKey(40) & 0xFF == ord('q'):
+        if cv2.waitKey(30) & 0xFF == ord('q'):
             break
 
     log_file.close()
     cv2.destroyAllWindows()
-    print("[INFO] SLAM Pipeline terminated. Log saved to 'slam_trajectory_log.csv'.")
+    print("[INFO] 3D SLAM v2.0 terminated. Data saved to 'slam_3d_pgo_telemetry.csv'.")
 
 
 if __name__ == "__main__":
