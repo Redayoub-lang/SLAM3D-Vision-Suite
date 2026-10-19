@@ -1,37 +1,37 @@
-# SLAM3D-Vision-Suite (v2.0 Industrial Edition)
-## Visual-LiDAR 3D SLAM with GICP, Pose Graph Optimization (PGO) & OctoMap
+# SLAM3D-Vision-Suite (v3.0 Enterprise Edition)
+## Factor Graph Visual-LiDAR-Inertial SLAM with Semantic Dynamic Filtering
 
-An industrial-grade 3D Simultaneous Localization and Mapping (SLAM) pipeline featuring **Generalized ICP (GICP)** scan matching, **SE(3) Levenberg-Marquardt Pose Graph Optimization (PGO)**, and **3D Probabilistic Log-Odds OctoMap Voxel Mapping**.
+An enterprise-grade 3D Simultaneous Localization and Mapping (SLAM) suite featuring **6-DOF IMU Pre-Integration on $SO(3)$**, **Factor Graph Residual Optimization**, **AI Semantic Dynamic Point Cloud Masking**, and **Multi-Session Submap Graph Merging**.
 
 ---
 
-## Core Features in v2.0
+## Enterprise Features in v3.0
 
-* **Generalized ICP (GICP):** Surface normal covariance alignment in $SE(3)$ for high-precision frame registration.
-* **Non-Linear Pose Graph Optimization (PGO):** Corrects global trajectory drift using Levenberg-Marquardt optimization upon loop closure detection.
-* **Probabilistic 3D OctoMap:** Memory-efficient voxel grid log-odds representation for 3D navigation.
-* **Dual Trajectory Dashboard:** Live visual comparison between uncorrected raw drift trajectory (Red) and PGO optimized trajectory (Green).
-* **Data Exporter:** Auto-logging pose optimization parameters to `slam_3d_pgo_telemetry.csv`.
+* **IMU Pre-Integration Factor Graph:** Tight coupling of 6-DOF accelerometer and gyroscope biases with LiDAR geometric factors.
+* **Semantic Dynamic Filtering:** Real-time identification and dynamic removal of moving objects (pedestrians, vehicles) from voxel reconstruction.
+* **Multi-Session Submap Graph Manager:** Automated submap splitting, locking, and global keyframe optimization.
+* **Tactical VIO HUD:** Displays live VIO trajectory, IMU pre-integration integration time, submap status, and filtered point metrics.
+* **Telemetry Data Exporter:** Auto-exports factor graph VIO telemetry to `slam_v3_factor_graph_telemetry.csv`.
 
 ---
 
 ## Mathematical Formulation
 
-Pose graph edge residual error $\mathbf{e}_{ij} \in \mathbb{R}^6$ in $SE(3)$ is given by:
+IMU Pre-Integration delta rotation on $SO(3)$:
 
-$$\mathbf{e}_{ij}(\mathbf{T}_i, \mathbf{T}_j) = \text{Log}_{SE(3)} \left( \left(\mathbf{T}_{ij}^{\text{meas}}\right)^{-1} \cdot \mathbf{T}_i^{-1} \cdot \mathbf{T}_j \right)^\vee$$
+$$\Delta \mathbf{R}_{ij} = \prod_{k=i}^{j-1} \text{Exp}\left( (\boldsymbol{\omega}_k - \mathbf{b}_g) \Delta t \right)$$
 
-Optimized via Levenberg-Marquardt update:
+Factor Graph Residual Minimization:
 
-$$\left( \mathbf{J}^T \mathbf{\Omega} \mathbf{J} + \lambda \text{diag}(\mathbf{J}^T \mathbf{\Omega} \mathbf{J}) \right) \Delta \mathbf{x} = -\mathbf{J}^T \mathbf{\Omega} \mathbf{e}$$
+$$\arg\min_{\mathcal{X}} \left( \sum_{k} \Vert{}\mathbf{r}_{\text{prior}}\Vert{}^2 + \sum \Vert{}\mathbf{r}_{\text{IMU}}\Vert{}^2 + \sum \Vert{}\mathbf{r}_{\text{LiDAR}}\Vert{}^2 \right)$$
 
 ---
 
-## Quick Start
+## Quick Execution
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Launch 3D SLAM Engine
+# Run v3.0 Engine
 python slam3d_vision_engine.py
